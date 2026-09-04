@@ -75,22 +75,44 @@ class DownloadExecutionManager(
     private val lastReportedProgress = ConcurrentHashMap<String, Float>()
 
     // Track scheduled auto-retry jobs and their runId identity
+    private val retryLock = Any()
     private val scheduledRetryJobs = ConcurrentHashMap<String, Job>()
     private val scheduledRetryRunIds = ConcurrentHashMap<String, Long>()
 
     fun cancelPendingRetry(taskId: String) {
-        scheduledRetryJobs.remove(taskId)?.cancel()
-        scheduledRetryRunIds.remove(taskId)
+        synchronized(retryLock) {
+            scheduledRetryJobs.remove(taskId)?.cancel()
+            scheduledRetryRunIds.remove(taskId)
+        }
     }
 
     fun hasPendingRetry(taskId: String): Boolean {
-        return scheduledRetryJobs.containsKey(taskId)
+        synchronized(retryLock) {
+            return scheduledRetryJobs.containsKey(taskId)
+        }
     }
 
     fun clearTaskState(taskId: String) {
         speedSmoothers.remove(taskId)
         lastProgressUpdateTimes.remove(taskId)
         lastReportedProgress.remove(taskId)
+    }
+
+    suspend fun handleUnhandledException(taskId: String, error: Throwable) {
+        val current = repository.getTaskByIdSync(taskId)
+        if (current != null && !DownloadStateMachine.isTerminalOrPaused(current.status)) {
+            val errorMsg = error.localizedMessage ?: "Execution error: ${error.javaClass.simpleName}"
+            val updated = repository.markFailedOrCancelled(
+                id = taskId,
+                runId = current.runId,
+                status = DownloadStatus.FAILED,
+                errorMessage = errorMsg
+            )
+            if (updated == 0 && current.status == DownloadStatus.QUEUED) {
+                repository.markQueuedTaskFailed(taskId, errorMsg)
+            }
+            notificationManager.onTaskFailed(taskId, current.title, errorMsg)
+        }
     }
 
     suspend fun executeTask(taskId: String) {
@@ -134,6 +156,8 @@ class DownloadExecutionManager(
             return
         }
 
+        var lastKnownTask: DownloadTaskEntity = taskAtStart
+
         try {
             // Guard before storage check
             if (!isExecutionActive()) return
@@ -165,6 +189,7 @@ class DownloadExecutionManager(
             if (DownloadStateMachine.isTerminalOrPaused(currentBeforePreparing.status) || !isExecutionActive()) {
                 return
             }
+            lastKnownTask = currentBeforePreparing
 
             // Update stage to PREPARING (atomic check-and-set in DB)
             val preparingUpdated = repository.updateActiveState(
@@ -184,6 +209,7 @@ class DownloadExecutionManager(
             if (DownloadStateMachine.isTerminalOrPaused(currentBeforeDownloading.status) || !isExecutionActive()) {
                 return
             }
+            lastKnownTask = currentBeforeDownloading
 
             // Update stage to DOWNLOADING (atomic check-and-set in DB)
             val downloadingUpdated = repository.updateActiveState(
@@ -264,6 +290,7 @@ class DownloadExecutionManager(
                     if (currentBeforePublish == null || DownloadStateMachine.isTerminalOrPaused(currentBeforePublish.status) || !isExecutionActive() || currentBeforePublish.runId != executionRunId) {
                         return@fold
                     }
+                    lastKnownTask = currentBeforePublish
 
                     val publishUpdated = repository.updateActiveStage(
                         id = taskId,
@@ -325,6 +352,15 @@ class DownloadExecutionManager(
                     }
                 }
             )
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            android.util.Log.e("DownloadExecutionManager", "Task $taskId crashed in executeTask", t)
+            if (isExecutionActive()) {
+                handleDownloadFailure(taskId, executionRunId, lastKnownTask, t)
+            } else {
+                handleUnhandledException(taskId, t)
+            }
         } finally {
             activeRunIds.remove(taskId, executionRunId)
             clearTaskState(taskId)
@@ -372,43 +408,50 @@ class DownloadExecutionManager(
 
             if (canAutoRetry) {
                 val delayMs = RetryPolicy.getBackoffDelayMs(currentTask.retryCount)
-                cancelPendingRetry(taskId)
-                scheduledRetryRunIds[taskId] = runId
+                synchronized(retryLock) {
+                    cancelPendingRetry(taskId)
+                    scheduledRetryRunIds[taskId] = runId
 
-                val retryJob = scope.launch {
-                    try {
-                        delay(delayMs)
-                        if (!isActive) return@launch
+                    val retryJob = scope.launch {
+                        try {
+                            delay(delayMs)
+                            if (!isActive) return@launch
 
-                        // Guard 1: Ensure this scheduled retry session is still the active one
-                        if (scheduledRetryRunIds[taskId] != runId) return@launch
+                            // Guard 1: Ensure this scheduled retry session is still the active one
+                            if (scheduledRetryRunIds[taskId] != runId) return@launch
 
-                        // Guard 2: Verify current state in database
-                        // Task must not be CANCELLED or DELETED, and must strictly retain FAILED status and matching runId
-                        val taskAfterDelay = repository.getTaskByIdSync(taskId)
-                        if (taskAfterDelay == null ||
-                            taskAfterDelay.status != DownloadStatus.FAILED ||
-                            taskAfterDelay.runId != runId ||
-                            activeRunIds[taskId] != null
-                        ) {
-                            return@launch
+                            // Guard 2: Verify current state in database
+                            // Task must not be CANCELLED or DELETED, and must strictly retain FAILED status and matching runId
+                            val taskAfterDelay = repository.getTaskByIdSync(taskId)
+                            if (taskAfterDelay == null ||
+                                taskAfterDelay.status != DownloadStatus.FAILED ||
+                                taskAfterDelay.runId != runId ||
+                                activeRunIds[taskId] != null
+                            ) {
+                                return@launch
+                            }
+
+                            // Guard 3: Double check and consume scheduled token
+                            val consumed = synchronized(retryLock) {
+                                scheduledRetryRunIds.remove(taskId, runId)
+                            }
+                            if (consumed) {
+                                onRetryRequested(taskId, runId)
+                            }
+                        } finally {
+                            synchronized(retryLock) {
+                                val currentJob = coroutineContext[Job]
+                                if (currentJob != null) {
+                                    scheduledRetryJobs.remove(taskId, currentJob)
+                                } else {
+                                    scheduledRetryJobs.remove(taskId)
+                                }
+                                scheduledRetryRunIds.remove(taskId, runId)
+                            }
                         }
-
-                        // Guard 3: Double check and consume scheduled token
-                        if (scheduledRetryRunIds.remove(taskId, runId)) {
-                            onRetryRequested(taskId, runId)
-                        }
-                    } finally {
-                        val currentJob = coroutineContext[Job]
-                        if (currentJob != null) {
-                            scheduledRetryJobs.remove(taskId, currentJob)
-                        } else {
-                            scheduledRetryJobs.remove(taskId)
-                        }
-                        scheduledRetryRunIds.remove(taskId, runId)
                     }
+                    scheduledRetryJobs[taskId] = retryJob
                 }
-                scheduledRetryJobs[taskId] = retryJob
             } else {
                 notificationManager.onTaskFailed(
                     taskId, originalTask.title, errorMsg

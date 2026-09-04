@@ -34,6 +34,7 @@ class DownloadTaskLifecycle(
     private val taskMutexes: ConcurrentHashMap<String, Mutex>,
     private val runIdCounter: AtomicLong,
     private val onCancelPendingRetry: ((String) -> Unit)? = null,
+    private val onReleaseClaim: ((String) -> Unit)? = null,
     private val onTaskStateChanged: suspend () -> Unit
 ) {
 
@@ -153,6 +154,7 @@ class DownloadTaskLifecycle(
     suspend fun pauseDownloadSync(taskId: String) {
         getTaskMutex(taskId).withLock {
             onCancelPendingRetry?.invoke(taskId)
+            onReleaseClaim?.invoke(taskId)
 
             // 1. Invalidate execution identity so in-flight callbacks are dropped immediately
             activeRunIds.remove(taskId)
@@ -190,6 +192,7 @@ class DownloadTaskLifecycle(
     suspend fun resumeDownloadSync(taskId: String) {
         getTaskMutex(taskId).withLock {
             onCancelPendingRetry?.invoke(taskId)
+            onReleaseClaim?.invoke(taskId)
 
             // 1. Invalidate previous execution identity
             activeRunIds.remove(taskId)
@@ -235,6 +238,7 @@ class DownloadTaskLifecycle(
         getTaskMutex(taskId).withLock {
             // Cancel any pending auto-retry coroutine immediately
             onCancelPendingRetry?.invoke(taskId)
+            onReleaseClaim?.invoke(taskId)
 
             // 1. Invalidate execution identity
             activeRunIds.remove(taskId)
@@ -274,6 +278,7 @@ class DownloadTaskLifecycle(
     suspend fun retryDownloadSync(taskId: String, expectedRunId: Long? = null) {
         getTaskMutex(taskId).withLock {
             onCancelPendingRetry?.invoke(taskId)
+            onReleaseClaim?.invoke(taskId)
 
             val task = repository.getTaskByIdSync(taskId) ?: return@withLock
 
@@ -335,6 +340,7 @@ class DownloadTaskLifecycle(
         getTaskMutex(taskId).withLock {
             // Cancel any pending auto-retry coroutine immediately
             onCancelPendingRetry?.invoke(taskId)
+            onReleaseClaim?.invoke(taskId)
 
             // 1. Invalidate runId immediately
             activeRunIds.remove(taskId)

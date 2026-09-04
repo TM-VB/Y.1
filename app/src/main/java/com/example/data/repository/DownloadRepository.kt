@@ -74,6 +74,9 @@ class DownloadRepository(private val dao: DownloadTaskDao) {
         errorMessage: String
     ): Int = dao.markFailedOrCancelled(id, runId, status, errorMessage)
 
+    suspend fun markQueuedTaskFailed(id: String, errorMessage: String): Int =
+        dao.markQueuedTaskFailed(id, errorMessage)
+
     suspend fun findExistingTask(url: String, formatId: String, startTime: String?, endTime: String?): DownloadTaskEntity? =
         dao.findExistingTask(url, formatId, startTime, endTime)
 

@@ -44,7 +44,7 @@ interface DownloadTaskDao {
             eta = :eta, 
             downloadedSize = CASE WHEN :downloadedSize != '' THEN :downloadedSize ELSE downloadedSize END, 
             totalSize = CASE WHEN :totalSize != '' THEN :totalSize ELSE totalSize END 
-        WHERE id = :id AND (:runId = 0 OR runId = :runId) AND status NOT IN ('PAUSED', 'CANCELLED', 'COMPLETED', 'FAILED')
+        WHERE id = :id AND (runId = :runId OR (:runId = 0 AND runId = 0)) AND status NOT IN ('PAUSED', 'CANCELLED', 'COMPLETED', 'FAILED')
     """)
     suspend fun updateProgress(
         id: String,
@@ -84,7 +84,7 @@ interface DownloadTaskDao {
             stage = :stage,
             runId = :runId
         WHERE id = :id 
-          AND (runId = 0 OR runId = :runId) 
+          AND (status = 'QUEUED' OR status = 'INTERRUPTED' OR runId = :runId) 
           AND status NOT IN ('PAUSED', 'CANCELLED', 'COMPLETED', 'FAILED')
     """)
     suspend fun updateActiveState(
@@ -135,7 +135,9 @@ interface DownloadTaskDao {
             downloadSpeed = '',
             eta = '',
             errorMessage = :errorMessage
-        WHERE id = :id AND runId = :runId AND status NOT IN ('PAUSED', 'CANCELLED', 'COMPLETED')
+        WHERE id = :id 
+          AND (runId = :runId OR (status = 'QUEUED' AND :runId = 0)) 
+          AND status NOT IN ('PAUSED', 'CANCELLED', 'COMPLETED')
     """)
     suspend fun markFailedOrCancelled(
         id: String,
@@ -143,6 +145,16 @@ interface DownloadTaskDao {
         status: DownloadStatus,
         errorMessage: String
     ): Int
+
+    @Query("""
+        UPDATE download_tasks 
+        SET status = 'FAILED',
+            downloadSpeed = '',
+            eta = '',
+            errorMessage = :errorMessage
+        WHERE id = :id AND status = 'QUEUED'
+    """)
+    suspend fun markQueuedTaskFailed(id: String, errorMessage: String): Int
 
     @Query("SELECT * FROM download_tasks WHERE url = :url AND formatId = :formatId AND (((startTime IS NULL OR startTime = '') AND (:startTime IS NULL OR :startTime = '')) OR startTime = :startTime) AND (((endTime IS NULL OR endTime = '') AND (:endTime IS NULL OR :endTime = '')) OR endTime = :endTime) LIMIT 1")
     suspend fun findExistingTask(url: String, formatId: String, startTime: String?, endTime: String?): DownloadTaskEntity?

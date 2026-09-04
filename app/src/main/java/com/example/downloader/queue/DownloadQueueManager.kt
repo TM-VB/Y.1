@@ -58,6 +58,9 @@ class DownloadQueueManager(
         scope = scope,
         onStartTask = { taskId ->
             executionManager.executeTask(taskId)
+        },
+        onTaskExecutionFailed = { taskId, error ->
+            executionManager.handleUnhandledException(taskId, error)
         }
     )
 
@@ -71,13 +74,7 @@ class DownloadQueueManager(
         runIdCounter = runIdCounter,
         scope = scope,
         onExecutionFinished = { taskId ->
-            activeJobs[taskId]?.let { job ->
-                if (!job.isActive) {
-                    activeJobs.remove(taskId, job)
-                }
-            }
             coordinator.updateActiveCount(activeJobs.size)
-            coordinator.processQueue()
         },
         onRetryRequested = { taskId, scheduledRunId ->
             retryDownload(taskId, scheduledRunId)
@@ -95,6 +92,9 @@ class DownloadQueueManager(
         runIdCounter = runIdCounter,
         onCancelPendingRetry = { taskId ->
             executionManager.cancelPendingRetry(taskId)
+        },
+        onReleaseClaim = { taskId ->
+            coordinator.releaseClaim(taskId)
         },
         onTaskStateChanged = {
             coordinator.updateActiveCount(activeJobs.size)

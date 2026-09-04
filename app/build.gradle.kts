@@ -102,6 +102,12 @@ android {
       }
     }
   }
+
+tasks.withType<Test>().configureEach {
+  filter {
+    isFailOnNoMatchingTests = false
+  }
+}
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
